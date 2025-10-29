@@ -83,44 +83,8 @@ class QwenImageLoRAConverter(LoRAStateDictConverter):
             dit_dict[key] = lora_args
         return {"dit": dit_dict}
 
-    def _from_diffusers(self, lora_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
-        dit_dict = {}
-        for key, param in lora_state_dict.items():
-            origin_key = key
-            lora_a_suffix = None
-            if "lora_A.weight" in key:
-                lora_a_suffix = "lora_A.weight"
-                lora_b_suffix = "lora_B.weight"
-            
-            if lora_a_suffix is None:
-                continue
-
-            lora_args = {}
-            lora_args["down"] = param
-            lora_args["up"] = lora_state_dict[origin_key.replace(lora_a_suffix, lora_b_suffix)]
-            lora_args["rank"] = lora_args["up"].shape[1]
-            alpha_key = origin_key.replace(lora_a_suffix, "alpha")
-
-            if alpha_key in lora_state_dict:
-                alpha = lora_state_dict[alpha_key]
-            else:
-                alpha = lora_args["rank"]
-            lora_args["alpha"] = alpha
-
-            key = key.replace(f".{lora_a_suffix}", "")
-            key = key.replace("diffusion_model.", "")
-
-            if key.startswith("transformer") and "attn.to_out.0" in key:
-                key = key.replace("attn.to_out.0", "attn.to_out")
-            dit_dict[key] = lora_args
-        return {"dit": dit_dict}
-
     def convert(self, lora_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
-        key = list(lora_state_dict.keys())[0]
-        if key.startswith("diffusion_model."):
-            return self._from_diffusers(lora_state_dict)
-        else:
-            return self._from_diffsynth(lora_state_dict)
+        return self._from_diffsynth(lora_state_dict)
 
 
 class QwenImagePipeline(BasePipeline):
@@ -593,8 +557,8 @@ class QwenImagePipeline(BasePipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: str,
-        negative_prompt: str = "",
+        prompt: Union[str, List[str]],
+        negative_prompt: Union[str, List[str]] = "",
         # single image for edit, list for edit plus(QwenImageEdit2509)
         input_image: List[Image.Image] | Image.Image | None = None,
         cfg_scale: float = 4.0,  # true cfg
@@ -608,9 +572,18 @@ class QwenImagePipeline(BasePipeline):
         entity_prompts: Optional[List[str]] = None,
         entity_masks: Optional[List[Image.Image]] = None,
     ):
-        assert (height is None) == (width is None), "height and width should be set together"
-        is_edit_plus = isinstance(input_image, list)
+        # normalize prompts to list for batching
+        prompt_list = [prompt] if isinstance(prompt, str) else prompt
+        neg_prompt_list: List[str] | None
+        if isinstance(negative_prompt, str):
+            neg_prompt_list = None if negative_prompt == "" else [negative_prompt] * len(prompt_list)
+        else:
+            # if provided as list: require same length or broadcast empty to None if all empty
+            neg_prompt_list = negative_prompt if any(p.strip() for p in negative_prompt) else None
 
+        batch_size = len(prompt_list)
+
+        is_edit_plus = isinstance(input_image, list)
         if input_image is not None:
             if not isinstance(input_image, list):
                 input_image = [input_image]
@@ -622,11 +595,9 @@ class QwenImagePipeline(BasePipeline):
                 vae_width, vae_height = self.calculate_dimensions(1024 * 1024, img_width / img_height)
                 condition_images.append(img.resize((condition_width, condition_height), Image.LANCZOS))
                 vae_images.append(img.resize((vae_width, vae_height), Image.LANCZOS))
-            if width is None and height is None:
-                width, height = vae_images[-1].size
 
-        if width is None and height is None:
-            width, height = 1328, 1328
+            width, height = vae_images[-1].size
+
         self.validate_image_size(height, width, minimum=64, multiple_of=16)
 
         if not isinstance(controlnet_params, list):
@@ -640,7 +611,7 @@ class QwenImagePipeline(BasePipeline):
                 self.validate_image_size(height, width, minimum=64, multiple_of=16)
                 context_latents = self.prepare_image_latents(param.image.resize((width, height), Image.LANCZOS))
 
-        noise = self.generate_noise((1, 16, height // 8, width // 8), seed=seed, device="cpu", dtype=self.dtype).to(
+        noise = self.generate_noise((batch_size, 16, height // 8, width // 8), seed=seed, device="cpu", dtype=self.dtype).to(
             device=self.device
         )
         # dynamic shift
@@ -659,18 +630,18 @@ class QwenImagePipeline(BasePipeline):
         self.load_models_to_device(["encoder"])
         if image_latents is not None:
             prompt_emb, prompt_emb_mask = self.encode_prompt_with_image(
-                prompt, vae_images, condition_images, 1, 4096, is_edit_plus
+                prompt_list, vae_images, condition_images, 1, 4096, is_edit_plus
             )
-            if cfg_scale > 1.0 and negative_prompt != "":
+            if cfg_scale > 1.0 and neg_prompt_list is not None:
                 negative_prompt_emb, negative_prompt_emb_mask = self.encode_prompt_with_image(
-                    negative_prompt, vae_images, condition_images, 1, 4096, is_edit_plus
+                    neg_prompt_list, vae_images, condition_images, 1, 4096, is_edit_plus
                 )
             else:
                 negative_prompt_emb, negative_prompt_emb_mask = None, None
         else:
-            prompt_emb, prompt_emb_mask = self.encode_prompt(prompt, 1, 4096)
-            if cfg_scale > 1.0 and negative_prompt != "":
-                negative_prompt_emb, negative_prompt_emb_mask = self.encode_prompt(negative_prompt, 1, 4096)
+            prompt_emb, prompt_emb_mask = self.encode_prompt(prompt_list, 1, 4096)
+            if cfg_scale > 1.0 and neg_prompt_list is not None:
+                negative_prompt_emb, negative_prompt_emb_mask = self.encode_prompt(neg_prompt_list, 1, 4096)
             else:
                 negative_prompt_emb, negative_prompt_emb_mask = None, None
 
@@ -718,17 +689,28 @@ class QwenImagePipeline(BasePipeline):
         # Decode image
         self.load_models_to_device(["vae"])
         latents = rearrange(latents, "B C H W -> B C 1 H W")
-        vae_output = rearrange(
-            self.vae.decode(
-                latents.to(self.vae.model.encoder.conv1.weight.dtype),
-                device=self.vae.model.encoder.conv1.weight.device,
-                tiled=self.vae_tiled,
-                tile_size=self.vae_tile_size,
-                tile_stride=self.vae_tile_stride,
-            )[0],
-            "C B H W -> B C H W",
+        latents_list = [latents[i] for i in range(latents.shape[0])]
+        latents_list = [latent.to(self.vae.model.encoder.conv1.weight.dtype) for latent in latents_list]
+        vae_outputs = self.vae.decode(
+            latents_list,
+            device=self.vae.model.encoder.conv1.weight.device,
+            tiled=self.vae_tiled,
+            tile_size=self.vae_tile_size,
+            tile_stride=self.vae_tile_stride,
         )
-        image = self.vae_output_to_image(vae_output)
+
+        vae_output = torch.stack(vae_outputs, dim=0)
+        if vae_output.ndim == 5:
+            vae_output = vae_output.squeeze(2)
+        if vae_output.ndim == 4 and vae_output.shape[0] >= 1:
+            images_bhwc = rearrange(vae_output, "b c h w -> b h w c")
+            image_np = ((images_bhwc.float() / 2 + 0.5).clip(0, 1) * 255).cpu().numpy().astype("uint8")
+            if image_np.shape[0] == 1:
+                image = Image.fromarray(image_np[0])
+            else:
+                image = [Image.fromarray(img) for img in image_np]
+        else:
+            image = self.vae_output_to_image(vae_output)
         # Offload all models
         self.model_lifecycle_finish(["vae"])
         self.load_models_to_device([])
